@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "comfyui": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "tsx",
+        "D:\\imagegenerate\\mcp-server.ts"
+      ],
+      "env": {
+        "COMFYUI_HTTP_URL": "http://127.0.0.1:8188",
+        "COMFYUI_WS_URL": "ws://127.0.0.1:8188/ws"
+      }
+    }
+  }
+}

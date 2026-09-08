@@ -1,0 +1,281 @@
+{
+  "206": {
+    "inputs": {
+      "guidance": 2.5,
+      "conditioning": [
+        "207",
+        0
+      ]
+    },
+    "class_type": "FluxGuidance",
+    "_meta": {
+      "title": "Flux引导"
+    }
+  },
+  "207": {
+    "inputs": {
+      "conditioning": [
+        "215",
+        0
+      ],
+      "latent": [
+        "214",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "参考Latent"
+    }
+  },
+  "208": {
+    "inputs": {
+      "image": [
+        "231",
+        0
+      ]
+    },
+    "class_type": "FluxKontextImageScale",
+    "_meta": {
+      "title": "图像缩放为FluxKontext"
+    }
+  },
+  "210": {
+    "inputs": {
+      "unet_name": "flux1-dev-kontext_fp8_scaled.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNet加载器"
+    }
+  },
+  "211": {
+    "inputs": {
+      "clip_name1": "clip_l.safetensors",
+      "clip_name2": "t5\\t5xxl_fp8_e4m3fn.safetensors",
+      "type": "flux",
+      "device": "default"
+    },
+    "class_type": "DualCLIPLoader",
+    "_meta": {
+      "title": "双CLIP加载器"
+    }
+  },
+  "212": {
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "214": {
+    "inputs": {
+      "pixels": [
+        "208",
+        0
+      ],
+      "vae": [
+        "212",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE编码"
+    }
+  },
+  "215": {
+    "inputs": {
+      "text": [
+        "225",
+        0
+      ],
+      "speak_and_recognation": {
+        "__value__": [
+          false,
+          true
+        ]
+      },
+      "clip": [
+        "211",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP文本编码"
+    }
+  },
+  "216": {
+    "inputs": {
+      "conditioning": [
+        "215",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "条件零化"
+    }
+  },
+  "217": {
+    "inputs": {
+      "seed": 963206955066956,
+      "steps": 20,
+      "cfg": 1,
+      "sampler_name": "euler",
+      "scheduler": "simple",
+      "denoise": 1,
+      "model": [
+        "229",
+        0
+      ],
+      "positive": [
+        "206",
+        0
+      ],
+      "negative": [
+        "216",
+        0
+      ],
+      "latent_image": [
+        "214",
+        0
+      ]
+    },
+    "class_type": "KSampler",
+    "_meta": {
+      "title": "K采样器"
+    }
+  },
+  "218": {
+    "inputs": {
+      "filename_prefix": "xingdie",
+      "images": [
+        "226",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存图像"
+    }
+  },
+  "220": {
+    "inputs": {
+      "samples": [
+        "217",
+        0
+      ],
+      "vae": [
+        "212",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "223": {
+    "inputs": {
+      "image": "images.jpg"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "225": {
+    "inputs": {
+      "text": "Convert to Ghibli style",
+      "speak_and_recognation": {
+        "__value__": [
+          false,
+          true
+        ]
+      }
+    },
+    "class_type": "Text Multiline",
+    "_meta": {
+      "title": "Text Multiline"
+    }
+  },
+  "226": {
+    "inputs": {
+      "inputcount": 2,
+      "direction": "left",
+      "match_image_size": true,
+      "Update inputs(支持多图点我）": null,
+      "Update inputs": null,
+      "image_1": [
+        "231",
+        0
+      ],
+      "image_2": [
+        "220",
+        0
+      ]
+    },
+    "class_type": "ImageConcatMulti",
+    "_meta": {
+      "title": "Image Concatenate Multi"
+    }
+  },
+  "229": {
+    "inputs": {
+      "lora_name": "ghibliStyle_kontext_byJaneB.safetensors",
+      "strength_model": 1,
+      "strength_clip": 1,
+      "model": [
+        "210",
+        0
+      ],
+      "clip": [
+        "211",
+        0
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "加载LoRA"
+    }
+  },
+  "230": {
+    "inputs": {
+      "filename_prefix": "ComfyUI",
+      "images": [
+        "220",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存图像"
+    }
+  },
+  "231": {
+    "inputs": {
+      "aspect_ratio": "original",
+      "proportional_width": 1,
+      "proportional_height": 1,
+      "fit": "letterbox",
+      "method": "lanczos",
+      "round_to_multiple": "8",
+      "scale_to_side": "longest",
+      "scale_to_length": 1280,
+      "background_color": "#000000",
+      "image": [
+        "223",
+        0
+      ]
+    },
+    "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+    "_meta": {
+      "title": "图层工具：按宽高比缩放 V2"
+    }
+  }
+}

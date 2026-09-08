@@ -1,0 +1,188 @@
+{
+  "5": {
+    "inputs": {
+      "width": 768,
+      "height": 1024,
+      "batch_size": 1
+    },
+    "class_type": "EmptyLatentImage",
+    "_meta": {
+      "title": "空白潛在影像"
+    }
+  },
+  "8": {
+    "inputs": {
+      "samples": [
+        "16",
+        0
+      ],
+      "vae": [
+        "18",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE 解碼"
+    }
+  },
+  "9": {
+    "inputs": {
+      "filename_prefix": "model/model",
+      "images": [
+        "8",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "儲存圖片"
+    }
+  },
+  "10": {
+    "inputs": {
+      "unet_name": "flux1-dev-fp8-e4m3fn.safetensors",
+      "weight_dtype": "fp8_e4m3fn"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "載入擴散模型"
+    }
+  },
+  "11": {
+    "inputs": {
+      "clip_name1": "t5xxl_fp8_e4m3fn_scaled.safetensors",
+      "clip_name2": "clip_l.safetensors",
+      "type": "flux",
+      "device": "default"
+    },
+    "class_type": "DualCLIPLoader",
+    "_meta": {
+      "title": "雙 CLIP 載入器"
+    }
+  },
+  "12": {
+    "inputs": {
+      "lora_name": "flux\\Oil Painting style, textured brush strokes.safetensors",
+      "strength_model": 1.2000000000000002,
+      "strength_clip": 1,
+      "model": [
+        "10",
+        0
+      ],
+      "clip": [
+        "11",
+        0
+      ]
+    },
+    "class_type": "LoraLoader",
+    "_meta": {
+      "title": "載入 LoRA"
+    }
+  },
+  "14": {
+    "inputs": {
+      "sampler_name": "euler"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "K採樣器選擇"
+    }
+  },
+  "15": {
+    "inputs": {
+      "model": [
+        "12",
+        0
+      ],
+      "conditioning": [
+        "27",
+        0
+      ]
+    },
+    "class_type": "BasicGuider",
+    "_meta": {
+      "title": "基礎引導器"
+    }
+  },
+  "16": {
+    "inputs": {
+      "noise": [
+        "17",
+        0
+      ],
+      "guider": [
+        "15",
+        0
+      ],
+      "sampler": [
+        "14",
+        0
+      ],
+      "sigmas": [
+        "19",
+        0
+      ],
+      "latent_image": [
+        "5",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "SamplerCustomAdvanced"
+    }
+  },
+  "17": {
+    "inputs": {
+      "noise_seed": 939881903105395
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "隨機雜訊"
+    }
+  },
+  "18": {
+    "inputs": {
+      "vae_name": "ae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "載入 VAE"
+    }
+  },
+  "19": {
+    "inputs": {
+      "scheduler": "simple",
+      "steps": 20,
+      "denoise": 1,
+      "model": [
+        "10",
+        0
+      ]
+    },
+    "class_type": "BasicScheduler",
+    "_meta": {
+      "title": "BasicScheduler"
+    }
+  },
+  "27": {
+    "inputs": {
+      "text": "The photo shows a young, slender Asian woman with fair skin and long, straight black hair parted to the side. She is wearing a white T-shirt and denim shorts. She has a large chest and stands against a plain, light gray background. The image evokes a simple, clean aesthetic.",
+      "speak_and_recognation": {
+        "__value__": [
+          false,
+          true
+        ]
+      },
+      "clip": [
+        "12",
+        1
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP 文字編碼（提示詞）"
+    }
+  }
+}
