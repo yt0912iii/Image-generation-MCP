@@ -12,14 +12,18 @@ import { createServer as createViteServer } from 'vite';
 import { randomUUID } from 'crypto';
 import cors from 'cors';
 import os from 'os';
+import { spawn } from 'child_process';
+import { fileURLToPath } from 'url';
 
-// 將所有 console.log 重導向到 stderr，避免破壞 MCP stdio 的 JSON-RPC 協議
+// 取得當前檔案目錄（同時相容 ESM 與 CJS 環境）
+const __filenameResolved = typeof __filename !== 'undefined' ? __filename : fileURLToPath(import.meta.url);
+const __dirnameResolved = typeof __dirname !== 'undefined' ? __dirname : path.dirname(__filenameResolved);
+
+// 將所有 console.log 重導向到 stderr，避免破壞 MCP 的 JSON-RPC 通訊協議
 console.log = (...args: unknown[]) => console.error(...args);
 
 // 常數路徑與 URL 配置
 const COMFYUI_URL = process.env.COMFYUI_URL || 'http://127.0.0.1:8188';
-
-// 改用專案目錄下的資料夾，或使用者家目錄
 const COMFYUI_INPUT_DIR = process.env.COMFYUI_INPUT_DIR || path.join(process.cwd(), 'comfyui_input');
 const COMFYUI_OUTPUT_DIR = process.env.COMFYUI_OUTPUT_DIR || path.join(process.cwd(), 'comfyui_output');
 
@@ -45,11 +49,69 @@ const CN_NUM_MAP: Record<string, number> = {
   '六': 6, '七': 7, '八': 8, '九': 9, '十': 10, '十六': 16, '二十一': 21,
 };
 
+// ==========================================
+// 🚀 啟動時自動在背景執行 Python 敏感詞庫更新 (強化版)
+// ==========================================
+function updateLexiconInBackground(): void {
+  // 1. 優先使用腳本自身的目錄，若無則依序檢查當前工作目錄
+  const candidatePaths = [
+    path.join(__dirnameResolved, 'update_lexicon.py'),
+    path.join(process.cwd(), 'update_lexicon.py'),
+    path.join(process.cwd(), 'scripts', 'update_lexicon.py'),
+  ];
+
+  let targetScriptPath: string | null = null;
+  for (const p of candidatePaths) {
+    if (fs.existsSync(p)) {
+      targetScriptPath = p;
+      break;
+    }
+  }
+
+  if (!targetScriptPath) {
+    console.error('[Lexicon Updater] ❌ 找不到更新腳本 update_lexicon.py');
+    console.error(`[Lexicon Updater] 搜尋過的路徑: \n${candidatePaths.join('\n')}`);
+    return;
+  }
+
+  console.error(`[Lexicon Updater] 🚀 伺服器啟動，正在背景執行詞庫更新: ${targetScriptPath}`);
+
+  // 2. 判斷作業系統與 Python 指令 (Windows 下必須使用 shell: true 才能正確讀取 PATH 中的 python)
+  const isWin = process.platform === 'win32';
+  const pyCmd = process.env.PYTHON_PATH || (isWin ? 'python' : 'python3');
+
+  const child = spawn(pyCmd, [targetScriptPath], {
+    cwd: path.dirname(targetScriptPath),
+    env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    shell: isWin,
+  });
+
+  child.stdout?.on('data', (data) => {
+    process.stderr.write(`[Python Lexicon] ${data}`);
+  });
+
+  child.stderr?.on('data', (data) => {
+    process.stderr.write(`[Python Lexicon Error] ${data}`);
+  });
+
+  child.on('close', (code) => {
+    if (code === 0) {
+      console.error('[Lexicon Updater] ✓ 敏感詞庫更新與白名單過濾成功完成！');
+    } else {
+      console.error(`[Lexicon Updater] ✗ 詞庫更新程序退出，結束代碼: ${code}`);
+    }
+  });
+
+  child.on('error', (err) => {
+    console.error(`[Lexicon Updater] ❌ 啟動 Python 失敗: ${err.message}`);
+    console.error(`[Lexicon Updater] 提示: 請確認系統是否有安裝 Python 且已將 '${pyCmd}' 加入環境變數 PATH 中`);
+  });
+}
+
 // 智慧解析文字中的尺寸與比例
 function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width: number; height: number; hasSpecified: boolean } {
   if (!text) return { width: defaultW, height: defaultH, hasSpecified: false };
 
-  // 1. 像素解析度，如 "1024x768", "768*1024"
   const pixelMatch = text.match(/(\d{3,4})\s*[x*×]\s*(\d{3,4})/i);
   if (pixelMatch) {
     let w = parseInt(pixelMatch[1], 10);
@@ -59,7 +121,6 @@ function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width
     return { width: Math.max(64, w), height: Math.max(64, h), hasSpecified: true };
   }
 
-  // 2. 數字比例，如「4:3」、「16:9」
   const ratioMatch = text.match(/(\d{1,2})\s*[:：比對到]\s*(\d{1,2})/);
   if (ratioMatch) {
     const key = `${ratioMatch[1]}:${ratioMatch[2]}`;
@@ -68,7 +129,6 @@ function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width
     }
   }
 
-  // 3. 中文比例，如「四比三」、「十六比九」
   const cnRatioMatch = text.match(/(十六|二十一|[一二兩三四五六七八九十]+)\s*比\s*([一二兩三四五六七八九十]+)/);
   if (cnRatioMatch) {
     const n1 = CN_NUM_MAP[cnRatioMatch[1]];
@@ -81,7 +141,6 @@ function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width
     }
   }
 
-  // 4. 口語方向關鍵字
   if (/橫向|橫式|landscape/i.test(text)) {
     return { width: 1024, height: 768, hasSpecified: true };
   }
@@ -99,14 +158,12 @@ function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width
 async function resolveOrSaveImage(imageDataOrUrl: string, filename: string): Promise<string> {
   const fullPath = path.join(COMFYUI_INPUT_DIR, filename);
 
-  // 1. Base64
   if (imageDataOrUrl.startsWith('data:image')) {
     const base64 = imageDataOrUrl.split(',')[1];
     fs.writeFileSync(fullPath, base64, 'base64');
     return filename;
   }
 
-  // 2. ComfyUI 內建 URL (/api/view-comfy 或 /comfyui_output)
   if (imageDataOrUrl.startsWith('/api/view-comfy') || imageDataOrUrl.startsWith('/comfyui_output')) {
     const urlMatch = imageDataOrUrl.match(/filename=([^&]+)/);
     const rawName = urlMatch ? decodeURIComponent(urlMatch[1]) : path.basename(imageDataOrUrl);
@@ -126,7 +183,6 @@ async function resolveOrSaveImage(imageDataOrUrl: string, filename: string): Pro
     }
   }
 
-  // 3. 一般 HTTP/HTTPS 網址
   if (imageDataOrUrl.startsWith('http://') || imageDataOrUrl.startsWith('https://')) {
     const response = await fetch(imageDataOrUrl);
     if (response.ok) {
@@ -143,6 +199,9 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 8833;
   const app = express();
 
+  // 1. 立即在背景啟動敏感詞庫更新程序
+  updateLexiconInBackground();
+
   // 中間件設定
   app.use(cors());
   app.use(express.json({ limit: '50mb' }));
@@ -151,7 +210,6 @@ async function startServer() {
   if (!fs.existsSync(COMFYUI_INPUT_DIR)) fs.mkdirSync(COMFYUI_INPUT_DIR, { recursive: true });
   if (!fs.existsSync(COMFYUI_OUTPUT_DIR)) fs.mkdirSync(COMFYUI_OUTPUT_DIR, { recursive: true });
 
-  // 僅保留 4 大工作流提示
   const LLM_DISPATCH_PROMPT = `你是一位專業的 ComfyUI 生成式 AI 數位人專員。
 請分析使用者的輸入意圖與提供的上下文，將其分類至最適當的圖像工作流，並將提詞優化為高品質的英文 Prompt。
 
@@ -206,11 +264,9 @@ async function startServer() {
   ): Record<string, any> {
     const cloned = JSON.parse(JSON.stringify(workflow));
 
-    // 1. 第一層：依據指定 Node ID 精準注入
     for (const [nodeId, replacementsObj] of Object.entries(replacements)) {
       if (cloned[nodeId]) {
         if (!cloned[nodeId].inputs) cloned[nodeId].inputs = {};
-
         for (const [key, value] of Object.entries(replacementsObj)) {
           cloned[nodeId].inputs[key] = value;
           console.log(`[ComfyUI Node ${nodeId}] 成功寫入 ${key} = "${String(value).substring(0, 50)}..."`);
@@ -218,7 +274,6 @@ async function startServer() {
       }
     }
 
-    // 2. 第二層：全域自動掃描並強制替換所有 Prompt 節點（雙重保險）
     if (userPrompt && userPrompt.trim() !== '') {
       for (const nodeId of Object.keys(cloned)) {
         const node = cloned[nodeId];
@@ -270,7 +325,7 @@ async function startServer() {
     return data.prompt_id;
   }
 
-  async function pollCompletion(promptId: string, maxAttempts: number = 60, pollIntervalMs: number = 2000): Promise<any> {
+  async function pollCompletion(promptId: string, maxAttempts = 60, pollIntervalMs = 2000): Promise<any> {
     for (let i = 0; i < maxAttempts; i++) {
       await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
       const response = await fetch(`${COMFYUI_URL}/history/${promptId}`);
@@ -327,7 +382,7 @@ async function startServer() {
       console.warn(`[LLM Warning] vLLM 無法連線 (${error.message})，轉用 Ollama 後備方案`);
       try {
         return await callOllama(prompt);
-      } catch (ollamaError: any) {
+      } catch {
         console.warn(`[LLM Warning] vLLM 與 Ollama 皆離線，觸發安全Fallback回應`);
         return JSON.stringify({
           workflowId: 'flux_t2i',
@@ -467,7 +522,6 @@ async function startServer() {
     outputPrefix: string;
   }
 
-  // 4 大圖像工作流映射
   const WORKFLOW_PARAM_MAPS: Record<string, WorkflowParamMapping> = {
     'flux_t2i': {
       workflowFile: 'FLUX_t2i.json',
@@ -524,7 +578,6 @@ async function startServer() {
     }
   );
 
-  // 1. 註冊 MCP Tools 清單
   mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
     return {
       tools: [
@@ -566,7 +619,6 @@ async function startServer() {
     };
   });
 
-  // 2. 處理 MCP 工具呼叫
   mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
 
@@ -652,15 +704,12 @@ async function startServer() {
   app.get('/sse', async (req: Request, res: Response) => {
     console.log('[MCP Server] 收到新的 SSE 連線請求');
     
-    // 建立 Transport 實例
     const transport = new SSEServerTransport('/messages', res);
     const sessionId = transport.sessionId;
     
-    // 立即記錄 Session
     transports.set(sessionId, transport);
     console.log(`[MCP Server] 註冊 Session ID: ${sessionId}`);
 
-    // 連線關閉時清理
     res.on('close', () => {
       console.log(`[MCP Server] SSE 連線關閉: ${sessionId}`);
       transports.delete(sessionId);
@@ -674,7 +723,6 @@ async function startServer() {
       console.error(`[MCP Server] Transport 異常 (${sessionId}):`, err);
     };
 
-    // 連線至 MCP Server
     await mcpServer.connect(transport);
   });
 
@@ -694,8 +742,6 @@ async function startServer() {
     }
 
     try {
-      // 關鍵修正：將 req.body 作為第三個參數傳入 handlePostMessage
-      // 這樣 SDK 就不會再去讀取已經被 express.json() 消費掉的 stream
       await transport.handlePostMessage(req, res, req.body);
     } catch (err: any) {
       console.error(`[MCP Server] handlePostMessage 處理失敗:`, err);

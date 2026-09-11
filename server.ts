@@ -42,7 +42,6 @@ const CN_NUM_MAP: Record<string, number> = {
 function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width: number; height: number; hasSpecified: boolean } {
   if (!text) return { width: defaultW, height: defaultH, hasSpecified: false };
 
-  // 1. 像素解析度，如 "1024x768", "768*1024"
   const pixelMatch = text.match(/(\d{3,4})\s*[x*×]\s*(\d{3,4})/i);
   if (pixelMatch) {
     let w = parseInt(pixelMatch[1], 10);
@@ -52,7 +51,6 @@ function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width
     return { width: Math.max(64, w), height: Math.max(64, h), hasSpecified: true };
   }
 
-  // 2. 數字比例，如「4:3」、「16:9」
   const ratioMatch = text.match(/(\d{1,2})\s*[:：比對到]\s*(\d{1,2})/);
   if (ratioMatch) {
     const key = `${ratioMatch[1]}:${ratioMatch[2]}`;
@@ -61,7 +59,6 @@ function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width
     }
   }
 
-  // 3. 中文比例，如「四比三」、「十六比九」
   const cnRatioMatch = text.match(/(十六|二十一|[一二兩三四五六七八九十]+)\s*比\s*([一二兩三四五六七八九十]+)/);
   if (cnRatioMatch) {
     const n1 = CN_NUM_MAP[cnRatioMatch[1]];
@@ -74,7 +71,6 @@ function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width
     }
   }
 
-  // 4. 口語方向關鍵字
   if (/橫向|橫式|landscape/i.test(text)) {
     return { width: 1024, height: 768, hasSpecified: true };
   }
@@ -92,14 +88,12 @@ function parseDimensions(text: string, defaultW = 768, defaultH = 1024): { width
 async function resolveOrSaveImage(imageDataOrUrl: string, filename: string): Promise<string> {
   const fullPath = path.join(COMFYUI_INPUT_DIR, filename);
 
-  // 1. Base64
   if (imageDataOrUrl.startsWith('data:image')) {
     const base64 = imageDataOrUrl.split(',')[1];
     fs.writeFileSync(fullPath, base64, 'base64');
     return filename;
   }
 
-  // 2. ComfyUI 內建 URL (/api/view-comfy 或 /comfyui_output)
   if (imageDataOrUrl.startsWith('/api/view-comfy') || imageDataOrUrl.startsWith('/comfyui_output')) {
     const urlMatch = imageDataOrUrl.match(/filename=([^&]+)/);
     const rawName = urlMatch ? decodeURIComponent(urlMatch[1]) : path.basename(imageDataOrUrl);
@@ -119,7 +113,6 @@ async function resolveOrSaveImage(imageDataOrUrl: string, filename: string): Pro
     }
   }
 
-  // 3. 一般 HTTP/HTTPS 網址
   if (imageDataOrUrl.startsWith('http://') || imageDataOrUrl.startsWith('https://')) {
     const response = await fetch(imageDataOrUrl);
     if (response.ok) {
@@ -132,19 +125,40 @@ async function resolveOrSaveImage(imageDataOrUrl: string, filename: string): Pro
   return imageDataOrUrl;
 }
 
+// 動態獲取請求的 Base URL（讓其他機器能拿到自己能連線的正確 IP）
+function getClientBaseUrl(req: Request, fallbackPort = 8833): string {
+  const host = req.get('host');
+  if (host && !host.startsWith('0.0.0.0')) {
+    return `${req.protocol}://${host}`;
+  }
+  const networkInterfaces = os.networkInterfaces();
+  for (const interfaceKey of Object.keys(networkInterfaces)) {
+    for (const net of networkInterfaces[interfaceKey] || []) {
+      if (net.family === 'IPv4' && !net.internal) {
+        return `http://${net.address}:${fallbackPort}`;
+      }
+    }
+  }
+  return `http://127.0.0.1:${fallbackPort}`;
+}
+
 async function startServer() {
   const PORT = 8833;
   const app = express();
 
-  // 中間件設定
-  app.use(cors());
+  // 允許跨來源請求與常見標頭
+  app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  }));
+
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
   if (!fs.existsSync(COMFYUI_INPUT_DIR)) fs.mkdirSync(COMFYUI_INPUT_DIR, { recursive: true });
   if (!fs.existsSync(COMFYUI_OUTPUT_DIR)) fs.mkdirSync(COMFYUI_OUTPUT_DIR, { recursive: true });
 
-  // 僅保留 4 大工作流提示
   const LLM_DISPATCH_PROMPT = `你是一位專業的 ComfyUI 生成式 AI 數位人專員。
 請分析使用者的輸入意圖與提供的上下文，將其分類至最適當的圖像工作流，並將提詞優化為高品質的英文 Prompt。
 
@@ -199,7 +213,6 @@ async function startServer() {
   ): Record<string, any> {
     const cloned = JSON.parse(JSON.stringify(workflow));
 
-    // 1. 第一層：依據指定 Node ID 精準注入
     for (const [nodeId, replacementsObj] of Object.entries(replacements)) {
       if (cloned[nodeId]) {
         if (!cloned[nodeId].inputs) cloned[nodeId].inputs = {};
@@ -211,7 +224,6 @@ async function startServer() {
       }
     }
 
-    // 2. 第二層：全域自動掃描並強制替換所有 Prompt 節點（雙重保險）
     if (userPrompt && userPrompt.trim() !== '') {
       for (const nodeId of Object.keys(cloned)) {
         const node = cloned[nodeId];
@@ -220,7 +232,6 @@ async function startServer() {
         const classType = node.class_type || '';
         const title = (node._meta?.title || '').toLowerCase();
 
-        // 判斷是否為文字編碼器且非負向詞
         const isNegative = title.includes('negative') || title.includes('負向') || title.includes('避雷');
         const isTextEncode = [
           'CLIPTextEncode',
@@ -264,7 +275,7 @@ async function startServer() {
     return data.prompt_id;
   }
 
-  async function pollCompletion(promptId: string, maxAttempts: number = 60, pollIntervalMs: number = 2000): Promise<any> {
+  async function pollCompletion(promptId: string, maxAttempts = 300, pollIntervalMs = 2000): Promise<any> {
     for (let i = 0; i < maxAttempts; i++) {
       await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
       const response = await fetch(`${COMFYUI_URL}/history/${promptId}`);
@@ -321,7 +332,7 @@ async function startServer() {
       console.warn(`[LLM Warning] vLLM 無法連線 (${error.message})，轉用 Ollama 後備方案`);
       try {
         return await callOllama(prompt);
-      } catch (ollamaError: any) {
+      } catch {
         console.warn(`[LLM Warning] vLLM 與 Ollama 皆離線，觸發安全Fallback回應`);
         return JSON.stringify({
           workflowId: 'flux_t2i',
@@ -366,13 +377,11 @@ async function startServer() {
     }
   }
 
-  // 針對 ghibli_style 指定優先擷取的節點 ID
   function extractOutputsFromHistory(historyData: any): { filename: string; subfolder: string; type: string } | null {
     try {
       const outputs = historyData?.outputs;
       if (!outputs) return null;
 
-      // 優先檢查常見的最終儲存節點 (如 9, 230, 171, 162)
       const priorityNodes = ['9', '230', '171', '162'];
       for (const nodeId of priorityNodes) {
         if (outputs[nodeId]) {
@@ -385,7 +394,6 @@ async function startServer() {
         }
       }
 
-      // 若優先節點未命中，直接取第一個產生圖片的節點之第 0 張 (第一張圖)
       for (const nodeId of Object.keys(outputs)) {
         const out = outputs[nodeId];
         if (out.images && out.images.length > 0) {
@@ -435,7 +443,7 @@ async function startServer() {
     const workflow = loadWorkflow(config.workflowFile);
     const modified = replaceWorkflowPlaceholders(workflow, config.replacements, '');
     const promptId = await submitWorkflow(modified);
-    const history = await pollCompletion(promptId, 60, 2000);
+    const history = await pollCompletion(promptId, 300, 2000);
 
     console.log('[ComfyUI] 工作流執行完成');
 
@@ -464,7 +472,6 @@ async function startServer() {
     outputPrefix: string;
   }
 
-  // 🎯 僅保留 4 大圖像工作流映射
   const WORKFLOW_PARAM_MAPS: Record<string, WorkflowParamMapping> = {
     'flux_t2i': {
       workflowFile: 'FLUX_t2i.json',
@@ -566,7 +573,6 @@ async function startServer() {
         finalWorkflowId = uploadedImage ? 'image_edit' : 'flux_t2i';
       }
 
-      // 尺寸解析
       const sizeParsed = parseDimensions(userPrompt || '');
       const hasSizeInText = sizeParsed.hasSpecified;
       let sizeOptions: any[] | undefined = undefined;
@@ -609,7 +615,7 @@ async function startServer() {
     }
   });
 
-  // --- 步驟二：Dispatch Endpoint (發送給 ComfyUI 執行) ---
+  // --- 步驟二：Dispatch Endpoint ---
   app.post('/api/generate/dispatch', async (req: Request, res: Response) => {
     try {
       const { userPrompt, workflowId, params } = req.body;
@@ -713,7 +719,7 @@ async function startServer() {
     }
   });
 
-  // 🎯 數位員工專用頭像生成端點 (對接 Next.js 平台之 /api/digital-employee/portrait/mcp-generate)
+  // 🎯 數位員工專用頭像生成端點（含高精度 Few-Shot 英文轉譯與格式清理）
   app.post('/api/digital-employee/portrait/mcp-generate', async (req: Request, res: Response) => {
     try {
       const { prompt } = req.body;
@@ -723,7 +729,48 @@ async function startServer() {
 
       console.log(`[Portrait Gen] 收到數位員工頭像生成請求: "${prompt}"`);
 
-      // 1. 預設使用 flux_t2i 進行 1:1 正方頭像生成 (1024x1024)
+      // 1. 若包含中文等非 ASCII 字元，使用 Few-Shot 高保真 Prompt 轉譯
+      let englishPrompt = prompt;
+      const containsNonAscii = /[^\x00-\x7F]/.test(prompt);
+
+      if (containsNonAscii) {
+        try {
+          const translateInstruction = `You are a professional prompt translator and enhancer specifically for FLUX.1 image generation.
+Your task: Translate the user's Chinese concept into a high-accuracy, descriptive English prompt for a character portrait avatar.
+
+[Strict Rules]:
+1. PRESERVE EVERY KEY FEATURE: Accurately translate all specific traits (hair color, hairstyle, glasses, clothing, facial expression, species/race, artistic style). Never drop any details!
+2. FLUX AVATAR FORMULA: Format as: [Subject & Style], [Detailed Facial & Hair Features], [Clothing & Accessories], [Lighting & Color Palette], clean solid or soft studio background, avatar portrait, 8k resolution, highly detailed.
+3. OUTPUT RESTRICTION: Output ONLY the final plain text English prompt. NO introductory text, NO quotes, NO explanation, NO markdown.
+
+[Examples]:
+User: "一隻戴著發光霓虹藍耳機的摺耳貓工程師，極簡 3D 黏土風格，純白背景"
+Output: Minimalist 3D clay style avatar of a cute Scottish fold cat engineer wearing glowing neon blue headphones, clean lighting, centered portrait, solid pure white background, highly detailed 3D render.
+
+User: "二次元英倫執事風格的青年智囊，深藍色合身西裝與單片眼鏡，溫文儒雅微笑"
+Output: Anime art style portrait of a handsome young British butler and strategist, wearing a well-tailored dark blue suit and a monocle, gentle and refined smile, neat hairstyle, elegant rim lighting, clean minimalist background, crisp lines, masterpiece.
+
+User: "貓的溫柔妖精秘書，淡粉色長髮與可愛精靈尖耳，頭戴微型花環發光通訊器"
+Output: Anime illustration avatar of a gentle cat-fairy secretary, long soft pastel pink hair, cute pointed elf ears, wearing a delicate mini floral wreath with an integrated glowing cybernetic communicator, charming expression, soft diffused studio lighting, clean background, 8k resolution.
+
+User: "${prompt}"
+Output:`;
+
+          const llmOutput = await callLLM(translateInstruction);
+          englishPrompt = llmOutput
+            .replace(/```(?:json|markdown)?/gi, '')
+            .replace(/```/g, '')
+            .replace(/^(Output|Prompt|Here is the prompt):\s*/i, '')
+            .replace(/^["'\s]+|["'\s]+$/g, '')
+            .trim();
+
+          console.log(`[Portrait Gen] 🔤 自動翻譯後的精準英文提詞: "${englishPrompt}"`);
+        } catch (err: any) {
+          console.warn(`[Portrait Gen Warning] 自動翻譯失敗，回退至原始提詞: ${err.message}`);
+          englishPrompt = prompt;
+        }
+      }
+
       const mapping = WORKFLOW_PARAM_MAPS['flux_t2i'];
       if (!mapping) {
         return res.status(500).json({ success: false, error: '找不到 flux_t2i 工作流設定' });
@@ -744,7 +791,8 @@ async function startServer() {
                 replacements[nodeId][paramKey] = seed;
                 break;
               case 'prompt':
-                replacements[nodeId][paramKey] = prompt;
+                // 注入翻譯後的精確英文提詞
+                replacements[nodeId][paramKey] = englishPrompt;
                 break;
               case 'width':
                 replacements[nodeId][paramKey] = width;
@@ -761,19 +809,19 @@ async function startServer() {
         }
       }
 
-      // 2. 載入工作流並執行
       const workflow = loadWorkflow(mapping.workflowFile);
-      const modified = replaceWorkflowPlaceholders(workflow, replacements, prompt);
+      const modified = replaceWorkflowPlaceholders(workflow, replacements, englishPrompt);
       const promptId = await submitWorkflow(modified);
-      const history = await pollCompletion(promptId, 60, 2000);
+      const history = await pollCompletion(promptId, 300, 2000);
 
       const outputFileInfo = extractOutputsFromHistory(history);
       if (!outputFileInfo) {
         throw new Error('ComfyUI 產圖完成，但未能取得輸出圖檔資訊');
       }
 
-      // 3. 回傳圖片 URL（透過自身的 view-comfy API 轉傳）
-      const imageUrl = `http://127.0.0.1:${PORT}/api/view-comfy?filename=${encodeURIComponent(
+      // 🎯 依連入來源動態建構完整 URL，支援跨機器存取
+      const baseUrl = getClientBaseUrl(req, PORT);
+      const imageUrl = `${baseUrl}/api/view-comfy?filename=${encodeURIComponent(
         outputFileInfo.filename
       )}&subfolder=${encodeURIComponent(outputFileInfo.subfolder || '')}&type=${encodeURIComponent(
         outputFileInfo.type || 'output'
@@ -921,7 +969,8 @@ async function startServer() {
   const vite = await createViteServer({
     server: {
       middlewareMode: true,
-      hmr: { port: 24679 },
+      host: '0.0.0.0', // 支援同網域存取 Vite 模組
+      hmr: { port: 24679, host: '0.0.0.0' },
       allowedHosts: true,
     },
     appType: 'spa',
@@ -932,7 +981,8 @@ async function startServer() {
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`=================================================`);
-    console.log(`🚀 Express Backend Server running on http://127.0.0.1:${PORT}`);
+    console.log(`🚀 Express Backend Server running on http://0.0.0.0:${PORT}`);
+    console.log(`🌐 允許同網域其他機器直接發送 HTTP 請求至本機 8833 埠`);
     console.log(`=================================================`);
   });
 
