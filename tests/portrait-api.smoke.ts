@@ -1,4 +1,4 @@
-// 冒煙測試：以假 ComfyUI / vLLM 啟動 mcp-server.ts，透過 MCP Client 驗證 generate_portrait。
+// 冒煙測試：以假 ComfyUI / vLLM 啟動 mcp-server.ts，透過 HTTP 驗證 POST /api/portraits/generate。
 // 執行：npm run test:mcp
 // 不會連線真實 ComfyUI 或 LLM；只能證明 MCP 介面與流程行為。
 
@@ -7,9 +7,6 @@ import http from 'node:http';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
 import type { AddressInfo } from 'node:net';
-import { Client } from '@modelcontextprotocol/sdk/client/index.js';
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
-import { SSEClientTransport } from '@modelcontextprotocol/sdk/client/sse.js';
 
 const TOKEN = 'smoke-test-token';
 const WEBUI_PASSWORD = 'smoke-webui-password';
@@ -84,23 +81,20 @@ const llm = http.createServer(async (req, res) => {
 const EXPECTED_PROMPT =
   'Minimalist 3D clay cat engineer avatar, clean soft studio background, avatar portrait, centered head and shoulders composition, highly detailed';
 
-async function connect(base: string, kind: 'http' | 'sse', token = TOKEN) {
-  const headers = token ? { Authorization: `Bearer ${token}` } : {};
-  const client = new Client({ name: 'smoke', version: '1.0.0' });
-  const transport =
-    kind === 'http'
-      ? new StreamableHTTPClientTransport(new URL(`${base}/mcp`), { requestInit: { headers } })
-      : new SSEClientTransport(new URL(`${base}/sse`), {
-          requestInit: { headers },
-          eventSourceInit: { fetch: (url, init) => fetch(url, { ...init, headers: { ...(init?.headers as any), ...headers } }) },
-        });
-  await client.connect(transport);
-  return client;
+async function generatePortrait(
+  base: string,
+  body: unknown,
+  headers: Record<string, string> = { Authorization: `Bearer ${TOKEN}` }
+) {
+  return fetch(`${base}/api/portraits/generate`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json; charset=utf-8', ...headers },
+    body: JSON.stringify(body),
+  });
 }
 
-function parseText(result: any) {
-  const text = result.content.find((c: any) => c.type === 'text');
-  return JSON.parse(text.text);
+async function errorCode(res: Response) {
+  return ((await res.json()) as { code?: string }).code;
 }
 
 async function waitForServer(base: string, child: ReturnType<typeof spawn>) {
@@ -108,7 +102,7 @@ async function waitForServer(base: string, child: ReturnType<typeof spawn>) {
   while (Date.now() < deadline) {
     if (child.exitCode !== null) throw new Error(`server exited with ${child.exitCode}`);
     try {
-      const res = await fetch(`${base}/mcp`, { method: 'GET' });
+      const res = await generatePortrait(base, { prompt: 'x' }, {});
       if (res.status === 401) return;
     } catch {}
     await new Promise((r) => setTimeout(r, 500));
@@ -129,7 +123,7 @@ async function main() {
       PORT: String(port),
       // 綁定所有介面，才能從本機區網 IP 模擬「其他電腦」連線
       HOST: '0.0.0.0',
-      MCP_AUTH_TOKEN: TOKEN,
+      PORTRAIT_API_TOKEN: TOKEN,
       WEBUI_PASSWORD,
       COMFYUI_URL: `http://127.0.0.1:${comfyPort}`,
       VLLM_URL: `http://127.0.0.1:${llmPort}`,
@@ -145,83 +139,76 @@ async function main() {
   try {
     await waitForServer(base, child);
 
-    // 1. 未帶 Token 被拒絕
-    const unauth = await fetch(`${base}/mcp`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream' },
-      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
-    });
+    // 1. 未帶 Token 或 Token 錯誤被拒絕
+    const unauth = await generatePortrait(base, { prompt: 'cat' }, {});
     assert.equal(unauth.status, 401, 'missing token should be 401');
-    const wrong = await fetch(`${base}/sse`, { headers: { Authorization: 'Bearer nope' } });
-    assert.equal(wrong.status, 401, 'wrong token on /sse should be 401');
+    const wrong = await generatePortrait(base, { prompt: 'cat' }, { Authorization: 'Bearer nope' });
+    assert.equal(wrong.status, 401, 'wrong token should be 401');
     console.log('✓ 驗證：缺少或錯誤 Token 回 401');
 
-    const client = await connect(base, 'http');
-
-    // 2. 只公開 generate_portrait
-    const tools = await client.listTools();
-    assert.deepEqual(tools.tools.map((t) => t.name), ['generate_portrait']);
-    console.log('✓ 工具清單只有 generate_portrait');
-
-    // 3. 中文提示詞：轉譯後送進 FLUX，回傳圖片
-    const progress: string[] = [];
-    const ok: any = await client.callTool(
-      { name: 'generate_portrait', arguments: { prompt: '戴著藍色耳機的貓工程師', seed: 42 } },
-      undefined,
-      { onprogress: (p) => progress.push(p.message || '') }
-    );
-    assert.ok(!ok.isError, JSON.stringify(ok));
-    const image = ok.content.find((c: any) => c.type === 'image');
-    assert.equal(image.mimeType, 'image/png');
-    assert.deepEqual(Buffer.from(image.data, 'base64'), PNG);
-    const meta = parseText(ok);
-    assert.equal(meta.englishPrompt, EXPECTED_PROMPT);
-    assert.equal(meta.translated, true);
-    assert.equal(meta.translationProvider, 'vLLM');
+    // 2. 中文提示詞：轉譯後送進 FLUX，回傳 PNG 原始位元組
+    const ok = await generatePortrait(base, { prompt: '戴著藍色耳機的貓工程師', seed: 42 });
+    assert.equal(ok.status, 200, await ok.clone().text());
+    assert.equal(ok.headers.get('content-type'), 'image/png');
+    assert.deepEqual(Buffer.from(await ok.arrayBuffer()), PNG);
+    assert.equal(ok.headers.get('x-portrait-seed'), '42');
+    assert.equal(ok.headers.get('x-portrait-translated'), 'true');
     assert.equal(llmCalls, 2, 'Chinese residue should trigger exactly one retry');
-    assert.equal(meta.seed, 42);
     const wf = submitted.at(-1);
     assert.equal(wf['27'].inputs.text, EXPECTED_PROMPT);
     assert.equal(wf['17'].inputs.noise_seed, 42);
     assert.equal(wf['5'].inputs.width, 1024);
     assert.equal(wf['5'].inputs.height, 1024);
-    assert.ok(progress.length > 0, 'should report progress');
     assert.equal(wf['9'].class_type, 'PreviewImage', 'portraits must not be kept in ComfyUI output');
     assert.equal(viewTypes.at(-1), 'temp', 'image must be fetched from ComfyUI temp');
-    console.log('✓ 中文提示詞轉譯（殘留中文會重試）、PreviewImage 從 temp 取圖、回傳 PNG 與進度通知');
+    console.log('✓ 中文提示詞轉譯（殘留中文會重試）、PreviewImage 從 temp 取圖、回傳 PNG');
+
+    // 3. 英文提示詞不經翻譯
+    const english = await generatePortrait(base, { prompt: 'a cat avatar' });
+    assert.equal(english.status, 200);
+    assert.equal(english.headers.get('x-portrait-translated'), 'false');
+    await english.arrayBuffer();
+    console.log('✓ 英文提示詞直接使用');
 
     // 4. 繁體敏感詞被擋，且不送 ComfyUI
     const before = submitted.length;
-    const blocked: any = await client.callTool({ name: 'generate_portrait', arguments: { prompt: '血腥的頭像' } });
-    assert.equal(blocked.isError, true);
-    assert.equal(parseText(blocked).code, 'BLOCKED_PROMPT');
-    const blockedTw: any = await client.callTool({ name: 'generate_portrait', arguments: { prompt: '法輪功' } });
-    assert.equal(parseText(blockedTw).code, 'BLOCKED_PROMPT');
+    const blocked = await generatePortrait(base, { prompt: '血腥的頭像' });
+    assert.equal(blocked.status, 422);
+    assert.equal(await errorCode(blocked), 'BLOCKED_PROMPT');
+    const blockedTw = await generatePortrait(base, { prompt: '法輪功' });
+    assert.equal(await errorCode(blockedTw), 'BLOCKED_PROMPT');
     assert.equal(submitted.length, before, 'blocked prompt must not reach ComfyUI');
-    console.log('✓ 繁體敏感詞轉簡體後被擋下，未送出 ComfyUI');
+    console.log('✓ 繁體敏感詞轉簡體後被擋下（422），未送出 ComfyUI');
 
     // 5. 參數錯誤
-    const bad: any = await client.callTool({ name: 'generate_portrait', arguments: { prompt: 'cat', width: 100 } });
-    assert.equal(parseText(bad).code, 'INVALID_ARGUMENT');
-    console.log('✓ 尺寸超出範圍回 INVALID_ARGUMENT');
+    const bad = await generatePortrait(base, { prompt: 'cat', width: 100 });
+    assert.equal(bad.status, 422);
+    assert.equal(await errorCode(bad), 'INVALID_ARGUMENT');
+    const empty = await generatePortrait(base, {});
+    assert.equal(await errorCode(empty), 'INVALID_ARGUMENT');
+    console.log('✓ 參數錯誤回 422 INVALID_ARGUMENT');
 
     // 6. ComfyUI 執行失敗
     failNext = true;
-    const failed: any = await client.callTool({ name: 'generate_portrait', arguments: { prompt: 'a cat avatar' } });
+    const failed = await generatePortrait(base, { prompt: 'a cat avatar' });
     failNext = false;
-    assert.equal(parseText(failed).code, 'COMFYUI_FAILED');
-    console.log('✓ ComfyUI 回報錯誤時回 COMFYUI_FAILED');
-    await client.close();
+    assert.equal(failed.status, 502);
+    assert.equal(await errorCode(failed), 'COMFYUI_FAILED');
+    console.log('✓ ComfyUI 回報錯誤時回 502 COMFYUI_FAILED');
 
-    // 7. 舊版 SSE 仍可使用
-    const sse = await connect(base, 'sse');
-    const sseResult: any = await sse.callTool({ name: 'generate_portrait', arguments: { prompt: 'a cat avatar' } });
-    assert.ok(!sseResult.isError);
-    assert.equal(parseText(sseResult).translated, false);
-    await sse.close();
-    console.log('✓ 舊版 SSE 傳輸可呼叫 generate_portrait');
+    // 7. MCP 端點已移除
+    for (const p of ['/mcp', '/messages']) {
+      const res = await fetch(`${base}${p}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', Authorization: `Bearer ${TOKEN}` },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      });
+      const text = await res.text();
+      assert.ok(!text.includes('generate_portrait'), `${p} must not serve MCP`);
+    }
+    console.log('✓ /mcp、/messages 不再提供 MCP');
 
-    // 8. view-comfy 只允許 output
+    // 8. view-comfy 只允許 output／temp
     const input = await fetch(`${base}/api/view-comfy?filename=a.png&type=input`);
     assert.equal(input.status, 400);
     const temp = await fetch(`${base}/api/view-comfy?filename=a.png&type=temp`);
@@ -238,7 +225,9 @@ async function main() {
       console.log('- 找不到區網 IPv4，略過外部連線測試');
     } else {
       const remote = `http://${lanIp}:${port}`;
-      const basic = (pw: string) => ({ Authorization: `Basic ${Buffer.from(`tester:${pw}`).toString('base64')}` });
+      const basic = (pw: string) => ({
+        Authorization: `Basic ${Buffer.from(`tester:${pw}`).toString('base64')}`,
+      });
       const page = await fetch(`${remote}/`);
       assert.equal(page.status, 401, 'remote Web UI without password should be 401');
       assert.match(page.headers.get('www-authenticate') || '', /^Basic /);
@@ -246,12 +235,12 @@ async function main() {
       assert.equal(wrongPw.status, 401, 'wrong Web UI password should be 401');
       const rightPw = await fetch(`${remote}/api/comfyui/queue`, { headers: basic(WEBUI_PASSWORD) });
       assert.ok(rightPw.status !== 401 && rightPw.status !== 403, `right password should pass, got ${rightPw.status}`);
-      const remoteMcpNoToken = await fetch(`${remote}/mcp`, { method: 'POST', headers: basic(WEBUI_PASSWORD) });
-      assert.equal(remoteMcpNoToken.status, 401, 'Web UI password must not unlock MCP');
-      const remoteClient = await connect(remote, 'http');
-      assert.deepEqual((await remoteClient.listTools()).tools.map((t) => t.name), ['generate_portrait']);
-      await remoteClient.close();
-      console.log('✓ 外部連線：Web UI 需密碼、本機免密碼；MCP 需 Token 且不接受 Web UI 密碼');
+      const pwOnly = await generatePortrait(remote, { prompt: 'cat' }, basic(WEBUI_PASSWORD));
+      assert.equal(pwOnly.status, 401, 'Web UI password must not unlock the portrait API');
+      const remoteOk = await generatePortrait(remote, { prompt: 'a cat avatar' });
+      assert.equal(remoteOk.status, 200);
+      await remoteOk.arrayBuffer();
+      console.log('✓ 外部連線：Web UI 需密碼、本機免密碼；頭像 API 需 Token 且不接受 Web UI 密碼');
     }
 
     console.log('\n全部通過');

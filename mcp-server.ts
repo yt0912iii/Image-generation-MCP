@@ -7,7 +7,7 @@ import cors from 'cors';
 import os from 'os';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
-import { registerPortraitMcp } from './lib/portrait-mcp.ts';
+import { PORTRAIT_GENERATE_PATH, registerPortraitHttp } from './lib/portrait-http.ts';
 import { containsCjk, translatePrompt, type TranslatorConfig } from './lib/portrait.ts';
 
 // 載入專案根目錄的 .env（不存在時略過；已設定的環境變數優先）
@@ -19,7 +19,7 @@ try {
 const __filenameResolved = typeof __filename !== 'undefined' ? __filename : fileURLToPath(import.meta.url);
 const __dirnameResolved = typeof __dirname !== 'undefined' ? __dirname : path.dirname(__filenameResolved);
 
-// 將所有 console.log 重導向到 stderr，避免破壞 MCP 的 JSON-RPC 通訊協議
+// 將所有 console.log 重導向到 stderr（日誌統一輸出到 stderr）
 console.log = (...args: unknown[]) => console.error(...args);
 
 // 常數路徑與 URL 配置
@@ -39,7 +39,8 @@ const PORTRAIT_OLLAMA_MODEL = process.env.PORTRAIT_OLLAMA_MODEL || 'qwen3.5:4b';
 
 // 伺服器綁定與存取控制
 const HOST = process.env.HOST || '127.0.0.1';
-const MCP_AUTH_TOKEN = (process.env.MCP_AUTH_TOKEN || '').trim();
+// 頭像生成 API 的 Bearer Token；MCP_AUTH_TOKEN 為舊名稱，仍可使用
+const PORTRAIT_API_TOKEN = (process.env.PORTRAIT_API_TOKEN || process.env.MCP_AUTH_TOKEN || '').trim();
 const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',')
   .map((origin) => origin.trim())
@@ -47,8 +48,8 @@ const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
 // 其他電腦開啟 Web UI 時要輸入的密碼（帳號任意）；未設定時 Web UI 只限本機
 const WEBUI_PASSWORD = process.env.WEBUI_PASSWORD || '';
-// 這些路徑屬於 MCP，由 MCP_AUTH_TOKEN 保護，不套用 Web UI 密碼
-const MCP_PATHS = new Set(['/mcp', '/sse', '/messages']);
+// 頭像生成 API 由 PORTRAIT_API_TOKEN 保護，不套用 Web UI 密碼
+const TOKEN_PATHS = new Set([PORTRAIT_GENERATE_PATH]);
 
 function isLoopbackAddress(address: string | undefined): boolean {
   return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
@@ -251,18 +252,18 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 8833;
   const app = express();
 
-  if (!MCP_AUTH_TOKEN && !LOOPBACK_HOSTS.has(HOST)) {
-    throw new Error(`HOST=${HOST} 會對外開放 MCP，請先設定 MCP_AUTH_TOKEN`);
+  if (!PORTRAIT_API_TOKEN && !LOOPBACK_HOSTS.has(HOST)) {
+    throw new Error(`HOST=${HOST} 會對外開放頭像生成 API，請先設定 PORTRAIT_API_TOKEN`);
   }
 
   // 1. 立即在背景啟動敏感詞庫更新程序
   updateLexiconInBackground();
 
   // 中間件設定
-  // 外部連線的存取控制：MCP 端點由 Bearer Token 保護（見 lib/portrait-mcp.ts）；
+  // 外部連線的存取控制：頭像生成 API 由 Bearer Token 保護（見 lib/portrait-http.ts）；
   // Web UI 與其 API 從本機開啟不需密碼，從其他電腦開啟需輸入 WEBUI_PASSWORD（HTTP Basic）。
   app.use((req: Request, res: Response, next) => {
-    if (MCP_PATHS.has(req.path) || isLoopbackAddress(req.socket.remoteAddress)) return next();
+    if (TOKEN_PATHS.has(req.path) || isLoopbackAddress(req.socket.remoteAddress)) return next();
     if (!WEBUI_PASSWORD) {
       res.status(403).send('Web UI 僅限本機使用；如需讓其他電腦測試，請在 .env 設定 WEBUI_PASSWORD');
       return;
@@ -638,7 +639,7 @@ async function startServer() {
     },
   };
 
-  // 中文提示詞翻譯設定（MCP 頭像與 Web UI 共用）
+  // 中文提示詞翻譯設定（頭像 API 與 Web UI 共用）
   const translator: TranslatorConfig = {
     vllmUrl: stripSlash(VLLM_URL),
     vllmModel: VLLM_MODEL,
@@ -648,10 +649,10 @@ async function startServer() {
   };
 
   // ==========================================
-  // MCP 端點（僅頭像文生圖，見 lib/portrait-mcp.ts）
+  // 頭像文生圖 HTTP API（見 lib/portrait-http.ts）
   // ==========================================
-  registerPortraitMcp(app, {
-    authToken: MCP_AUTH_TOKEN || undefined,
+  registerPortraitHttp(app, {
+    authToken: PORTRAIT_API_TOKEN || undefined,
     portrait: {
       comfyuiUrl: stripSlash(COMFYUI_URL),
       workflowFile: path.join(process.cwd(), 'workflow', 'FLUX_t2i.json'),
@@ -1035,14 +1036,14 @@ async function startServer() {
   const server = app.listen(PORT, HOST, () => {
     const shownHost = HOST.includes(':') ? `[${HOST}]` : HOST;
     console.log(`=================================================`);
-    console.log(`🚀 Image Generation MCP Server (Streamable HTTP + SSE + WebUI) 已啟動！`);
+    console.log(`🚀 Image Generation Server (頭像 API + WebUI) 已啟動！`);
     console.log(`• Web 前端網址: http://${shownHost}:${PORT}`);
-    console.log(`• MCP 端點: http://${shownHost}:${PORT}/mcp（舊版 SSE: /sse）`);
-    console.log(`• MCP 驗證: ${MCP_AUTH_TOKEN ? '已啟用 Bearer Token' : '未啟用（僅限本機）'}`);
+    console.log(`• 頭像 API: POST http://${shownHost}:${PORT}${PORTRAIT_GENERATE_PATH}`);
+    console.log(`• API 驗證: ${PORTRAIT_API_TOKEN ? '已啟用 Bearer Token' : '未啟用（僅限本機）'}`);
     console.log(`• Web UI 外部存取: ${WEBUI_PASSWORD ? '需輸入 WEBUI_PASSWORD' : '關閉（僅限本機）'}`);
     console.log(`=================================================`);
   });
-  // 生圖最長可達 PORTRAIT_TIMEOUT_SECONDS，避免 Node 預設 5 分鐘請求逾時中斷 MCP 呼叫
+  // 生圖最長可達 PORTRAIT_TIMEOUT_SECONDS，避免 Node 預設 5 分鐘請求逾時中斷頭像生成請求
   server.requestTimeout = (positiveIntEnv('PORTRAIT_TIMEOUT_SECONDS', 600) + 120) * 1000;
 
   process.on('SIGINT', () => {

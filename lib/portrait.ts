@@ -1,5 +1,5 @@
 // 數位員工頭像（文生圖）共用流程：敏感詞檢查 → 中文提示詞轉譯 → FLUX 工作流 → 取回圖片。
-// MCP 工具只走這條路徑；不提供圖生圖、修圖或放大。
+// 頭像 HTTP API（lib/portrait-http.ts）只走這條路徑；不提供圖生圖、修圖或放大。
 
 import fs from 'fs';
 import path from 'path';

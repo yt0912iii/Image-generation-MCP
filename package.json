@@ -9,12 +9,10 @@
     "preview": "vite preview",
     "server": "tsx server.ts",
     "mcp": "tsx mcp-server.ts",
-    "mcp:inspect": "npx @modelcontextprotocol/inspector",
-    "mcp:call": "tsx tests/call-portrait.ts",
-    "test:mcp": "tsx tests/portrait-mcp.smoke.ts"
+    "portrait:call": "tsx tests/call-portrait.ts",
+    "test:portrait": "tsx tests/portrait-api.smoke.ts"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.30.0",
     "cors": "^2.8.6",
     "express": "^5.3.0",
     "framer-motion": "^13.1.1",
