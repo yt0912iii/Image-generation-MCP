@@ -28,15 +28,14 @@
   },
   "9": {
     "inputs": {
-      "filename_prefix": "model/model",
       "images": [
         "8",
         0
       ]
     },
-    "class_type": "SaveImage",
+    "class_type": "PreviewImage",
     "_meta": {
-      "title": "儲存圖片"
+      "title": "預覽圖片（不保留在 output）"
     }
   },
   "10": {
