@@ -1,19 +1,19 @@
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import {
-  CallToolRequestSchema,
-  ListToolsRequestSchema,
-} from '@modelcontextprotocol/sdk/types.js';
-
 import express, { Request, Response } from 'express';
 import path from 'path';
 import fs from 'fs';
 import { createServer as createViteServer } from 'vite';
-import { randomUUID } from 'crypto';
+import { randomUUID, timingSafeEqual } from 'crypto';
 import cors from 'cors';
 import os from 'os';
 import { spawn } from 'child_process';
 import { fileURLToPath } from 'url';
+import { registerPortraitMcp } from './lib/portrait-mcp.ts';
+import { containsCjk, translatePrompt, type TranslatorConfig } from './lib/portrait.ts';
+
+// 載入專案根目錄的 .env（不存在時略過；已設定的環境變數優先）
+try {
+  process.loadEnvFile?.(path.join(process.cwd(), '.env'));
+} catch {}
 
 // 取得當前檔案目錄（同時相容 ESM 與 CJS 環境）
 const __filenameResolved = typeof __filename !== 'undefined' ? __filename : fileURLToPath(import.meta.url);
@@ -23,13 +23,60 @@ const __dirnameResolved = typeof __dirname !== 'undefined' ? __dirname : path.di
 console.log = (...args: unknown[]) => console.error(...args);
 
 // 常數路徑與 URL 配置
-const COMFYUI_URL = process.env.COMFYUI_URL || 'http://127.0.0.1:8188';
+const COMFYUI_URL = process.env.COMFYUI_URL || 'http://0.0.0.1:8188';
 const COMFYUI_INPUT_DIR = process.env.COMFYUI_INPUT_DIR || path.join(process.cwd(), 'comfyui_input');
 const COMFYUI_OUTPUT_DIR = process.env.COMFYUI_OUTPUT_DIR || path.join(process.cwd(), 'comfyui_output');
 
 // vLLM configuration
 const VLLM_URL = process.env.VLLM_URL || 'http://192.168.50.200:8787';
 const VLLM_MODEL = process.env.VLLM_MODEL || 'cyankiwi/Qwen3.6-35B-A3B-AWQ-4bit';
+
+// Ollama（vLLM 離線時的後備）
+const OLLAMA_URL = process.env.OLLAMA_URL || 'http://0.0.0.1:11434';
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:7b';
+// 頭像提示詞翻譯專用模型：qwen3.5:4b 在實測中最忠實且只佔約 3 GB VRAM，不易與 FLUX 搶顯存
+const PORTRAIT_OLLAMA_MODEL = process.env.PORTRAIT_OLLAMA_MODEL || 'qwen3.5:4b';
+
+// 伺服器綁定與存取控制
+const HOST = process.env.HOST || '127.0.0.1';
+const MCP_AUTH_TOKEN = (process.env.MCP_AUTH_TOKEN || '').trim();
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+// 其他電腦開啟 Web UI 時要輸入的密碼（帳號任意）；未設定時 Web UI 只限本機
+const WEBUI_PASSWORD = process.env.WEBUI_PASSWORD || '';
+// 這些路徑屬於 MCP，由 MCP_AUTH_TOKEN 保護，不套用 Web UI 密碼
+const MCP_PATHS = new Set(['/mcp', '/sse', '/messages']);
+
+function isLoopbackAddress(address: string | undefined): boolean {
+  return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1';
+}
+
+function safeEqual(given: string, expected: string): boolean {
+  const a = Buffer.from(given);
+  const b = Buffer.from(expected);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+// 頭像敏感詞使用的分類（data/Sensitive-lexicon/Vocabulary/<名稱>.txt），另加 data/portrait_blocklist.txt。
+// 不用合併後的 blocked_keywords.json：其中的網易／騰訊通用詞庫會擋下「未來」「客服」「代表」等一般詞。
+const PORTRAIT_LEXICON_CATEGORIES = (
+  process.env.PORTRAIT_LEXICON_CATEGORIES || '色情类型,色情词库,暴恐词库,涉枪涉爆,反动词库,政治类型'
+)
+  .split(',')
+  .map((name) => name.trim())
+  .filter((name) => /^[^\\/.]+$/.test(name));
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const value = Number.parseInt(process.env[name] || '', 10);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+
+function stripSlash(url: string): string {
+  return url.replace(/\/+$/, '');
+}
 
 // 常用比例對應的標準生成尺寸（適配 FLUX / SDXL）
 const ASPECT_RATIO_MAP: Record<string, { width: number; height: number }> = {
@@ -174,7 +221,12 @@ async function resolveOrSaveImage(imageDataOrUrl: string, filename: string): Pro
       return filename;
     }
 
-    const fetchUrl = `${COMFYUI_URL}/view?filename=${encodeURIComponent(rawName)}&type=output`;
+    // FLUX 文生圖改用 PreviewImage 後，結果在 ComfyUI 的 temp；沿用網址上的 type
+    const typeMatch = imageDataOrUrl.match(/[?&]type=(output|temp)(?:&|$)/);
+    const subfolderMatch = imageDataOrUrl.match(/[?&]subfolder=([^&]*)/);
+    const fetchUrl =
+      `${COMFYUI_URL}/view?filename=${encodeURIComponent(rawName)}` +
+      `&subfolder=${subfolderMatch ? subfolderMatch[1] : ''}&type=${typeMatch ? typeMatch[1] : 'output'}`;
     const res = await fetch(fetchUrl);
     if (res.ok) {
       const buffer = Buffer.from(await res.arrayBuffer());
@@ -199,11 +251,36 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 8833;
   const app = express();
 
+  if (!MCP_AUTH_TOKEN && !LOOPBACK_HOSTS.has(HOST)) {
+    throw new Error(`HOST=${HOST} 會對外開放 MCP，請先設定 MCP_AUTH_TOKEN`);
+  }
+
   // 1. 立即在背景啟動敏感詞庫更新程序
   updateLexiconInBackground();
 
   // 中間件設定
-  app.use(cors());
+  // 外部連線的存取控制：MCP 端點由 Bearer Token 保護（見 lib/portrait-mcp.ts）；
+  // Web UI 與其 API 從本機開啟不需密碼，從其他電腦開啟需輸入 WEBUI_PASSWORD（HTTP Basic）。
+  app.use((req: Request, res: Response, next) => {
+    if (MCP_PATHS.has(req.path) || isLoopbackAddress(req.socket.remoteAddress)) return next();
+    if (!WEBUI_PASSWORD) {
+      res.status(403).send('Web UI 僅限本機使用；如需讓其他電腦測試，請在 .env 設定 WEBUI_PASSWORD');
+      return;
+    }
+    const match = /^Basic\s+(.+)$/i.exec(req.headers.authorization || '');
+    if (match) {
+      const decoded = Buffer.from(match[1], 'base64').toString('utf8');
+      const password = decoded.slice(decoded.indexOf(':') + 1);
+      if (safeEqual(password, WEBUI_PASSWORD)) return next();
+    }
+    res.setHeader('WWW-Authenticate', 'Basic realm="imagegenerate", charset="UTF-8"');
+    res.status(401).send('需要登入');
+  });
+
+  // Web UI 與 API 同源；跨來源只開放 CORS_ORIGINS 列出的網址
+  if (CORS_ORIGINS.length > 0) {
+    app.use(cors({ origin: CORS_ORIGINS }));
+  }
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -357,8 +434,6 @@ async function startServer() {
   }
 
   async function callOllama(prompt: string): Promise<string> {
-    const OLLAMA_URL = process.env.OLLAMA_URL || 'http://127.0.0.1:11434';
-    const OLLAMA_MODEL = process.env.OLLAMA_MODEL || 'qwen2.5:7b';
     const response = await fetch(`${OLLAMA_URL}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -563,193 +638,46 @@ async function startServer() {
     },
   };
 
-  // ==========================================
-  // MCP Server 實例與工具註冊
-  // ==========================================
-  const mcpServer = new Server(
-    {
-      name: 'image-generation-mcp-server',
-      version: '1.0.0',
-    },
-    {
-      capabilities: {
-        tools: {},
-      },
-    }
-  );
+  // 中文提示詞翻譯設定（MCP 頭像與 Web UI 共用）
+  const translator: TranslatorConfig = {
+    vllmUrl: stripSlash(VLLM_URL),
+    vllmModel: VLLM_MODEL,
+    ollamaUrl: stripSlash(OLLAMA_URL),
+    ollamaModel: PORTRAIT_OLLAMA_MODEL,
+    translateTimeoutMs: positiveIntEnv('PORTRAIT_TRANSLATE_TIMEOUT_SECONDS', 60) * 1000,
+  };
 
-  mcpServer.setRequestHandler(ListToolsRequestSchema, async () => {
-    return {
-      tools: [
-        {
-          name: 'generate_portrait',
-          description: '生成數位員工肖像或高品質靜態圖片 (支援 FLUX、吉普力風格、圖像編輯與高清放大)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              prompt: { type: 'string', description: '圖片正向提示詞 (Positive Prompt)' },
-              workflowId: {
-                type: 'string',
-                enum: ['flux_t2i', 'ghibli_style', 'image_edit', 'upscale'],
-                description: '工作流 ID (預設 flux_t2i)',
-              },
-              width: { type: 'number', description: '寬度 (預設 768)' },
-              height: { type: 'number', description: '高度 (預設 768)' },
-              negativePrompt: { type: 'string', description: '負向提示詞' },
-              inputImage: { type: 'string', description: '參考圖檔名或 Base64' },
-            },
-            required: ['prompt'],
-          },
-        },
-        {
-          name: 'flux_t2i',
-          description: 'FLUX 靜態高畫質肖像文生圖 (相容捷徑)',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              prompt: { type: 'string', description: '提示詞' },
-              width: { type: 'number', default: 768 },
-              height: { type: 'number', default: 768 },
-              negativePrompt: { type: 'string' },
-            },
-            required: ['prompt'],
-          },
-        },
+  // ==========================================
+  // MCP 端點（僅頭像文生圖，見 lib/portrait-mcp.ts）
+  // ==========================================
+  registerPortraitMcp(app, {
+    authToken: MCP_AUTH_TOKEN || undefined,
+    portrait: {
+      comfyuiUrl: stripSlash(COMFYUI_URL),
+      workflowFile: path.join(process.cwd(), 'workflow', 'FLUX_t2i.json'),
+      lexiconFiles: [
+        ...PORTRAIT_LEXICON_CATEGORIES.map((name) =>
+          path.join(process.cwd(), 'data', 'Sensitive-lexicon', 'Vocabulary', `${name}.txt`)
+        ),
+        path.join(process.cwd(), 'data', 'portrait_blocklist.txt'),
       ],
-    };
+      whitelistFile: path.join(process.cwd(), 'data', 'whitelist.txt'),
+      ...translator,
+      timeoutMs: positiveIntEnv('PORTRAIT_TIMEOUT_SECONDS', 600) * 1000,
+      pollIntervalMs: 2000,
+      maxImageBytes: 10 * 1024 * 1024,
+    },
   });
 
-  mcpServer.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const { name, arguments: args } = request.params;
-
-    if (name === 'generate_portrait' || name === 'generate_image' || name === 'flux_t2i') {
-      const userPrompt = String(args?.prompt || args?.userPrompt || '');
-      const workflowId = String(args?.workflowId || (name === 'flux_t2i' ? 'flux_t2i' : 'flux_t2i'));
-      const mapping = WORKFLOW_PARAM_MAPS[workflowId] || WORKFLOW_PARAM_MAPS['flux_t2i'];
-
-      const width = Number(args?.width) || 768;
-      const height = Number(args?.height) || 768;
-      const negativePrompt = String(args?.negativePrompt || '');
-      const inputImage = args?.inputImage ? String(args.inputImage) : undefined;
-      const seed = Math.floor(Math.random() * 1000000000);
-
-      let imageFilename: string | undefined = undefined;
-      if (inputImage) {
-        const savedName = `input_${Date.now()}.png`;
-        imageFilename = await resolveOrSaveImage(inputImage, savedName);
-      }
-
-      const replacements: Record<string, Record<string, any>> = {};
-      for (const [nodeId, nodeParams] of Object.entries(mapping.nodeIds)) {
-        replacements[nodeId] = {};
-        for (const [paramKey, value] of Object.entries(nodeParams)) {
-          if (typeof value === 'string' && value.startsWith('{{') && value.endsWith('}}')) {
-            const key = value.slice(2, -2);
-            switch (key) {
-              case 'seed':
-                replacements[nodeId][paramKey] = seed;
-                break;
-              case 'prompt':
-                replacements[nodeId][paramKey] = userPrompt || '';
-                break;
-              case 'negativePrompt':
-                replacements[nodeId][paramKey] = negativePrompt;
-                break;
-              case 'width':
-                replacements[nodeId][paramKey] = width;
-                break;
-              case 'height':
-                replacements[nodeId][paramKey] = height;
-                break;
-              case 'inputImage':
-                if (imageFilename) replacements[nodeId][paramKey] = imageFilename;
-                break;
-              default:
-                replacements[nodeId][paramKey] = value;
-            }
-          } else {
-            replacements[nodeId][paramKey] = value;
-          }
-        }
-      }
-
-      const result = await executeWorkflowHelper({
-        workflowFile: mapping.workflowFile,
-        replacements,
-        outputPrefix: mapping.outputPrefix,
-      });
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              success: result.success,
-              outputUrl: result.outputUrl,
-              fullUrl: result.outputUrl ? `http://127.0.0.1:${PORT}${result.outputUrl}` : null,
-            }),
-          },
-        ],
-      };
+  /** Web UI 生圖：提示詞含中文時先忠實翻譯成英文（不加頭像構圖詞）；翻譯失敗則沿用原文 */
+  async function toEnglishPrompt(text: string): Promise<string> {
+    if (!text || !containsCjk(text)) return text;
+    const result = await translatePrompt(translator, text, { portrait: false });
+    if (result.translated) {
+      console.log(`[Translate] ${result.provider} → ${result.text}`);
     }
-
-    throw new Error(`未知的 MCP 工具: ${name}`);
-  });
-
-  // ==========================================
-  // MCP SSE 傳輸端點 (支援多 Session)
-  // ==========================================
-  const transports = new Map<string, SSEServerTransport>();
-
-  app.get('/sse', async (req: Request, res: Response) => {
-    console.log('[MCP Server] 收到新的 SSE 連線請求');
-    
-    const transport = new SSEServerTransport('/messages', res);
-    const sessionId = transport.sessionId;
-    
-    transports.set(sessionId, transport);
-    console.log(`[MCP Server] 註冊 Session ID: ${sessionId}`);
-
-    res.on('close', () => {
-      console.log(`[MCP Server] SSE 連線關閉: ${sessionId}`);
-      transports.delete(sessionId);
-    });
-
-    transport.onclose = () => {
-      transports.delete(sessionId);
-    };
-
-    transport.onerror = (err) => {
-      console.error(`[MCP Server] Transport 異常 (${sessionId}):`, err);
-    };
-
-    await mcpServer.connect(transport);
-  });
-
-  app.post('/messages', async (req: Request, res: Response) => {
-    const sessionId = (req.query.sessionId as string) || (req.headers['x-session-id'] as string);
-
-    if (!sessionId) {
-      console.error('[MCP Server] /messages 缺少 sessionId 參數');
-      return res.status(400).send('Missing sessionId');
-    }
-
-    const transport = transports.get(sessionId);
-
-    if (!transport) {
-      console.error(`[MCP Server] 找不到 Session: ${sessionId}`);
-      return res.status(400).send(`Session not found or expired: ${sessionId}`);
-    }
-
-    try {
-      await transport.handlePostMessage(req, res, req.body);
-    } catch (err: any) {
-      console.error(`[MCP Server] handlePostMessage 處理失敗:`, err);
-      if (!res.headersSent) {
-        res.status(500).send(err.message);
-      }
-    }
-  });
+    return result.text;
+  }
 
   // ==========================================
   // 原生 REST API 路由
@@ -757,9 +685,14 @@ async function startServer() {
   app.get('/api/view-comfy', async (req: Request, res: Response) => {
     const { filename, subfolder, type } = req.query;
     if (!filename) return res.status(400).send('Missing filename');
+    // 只轉發 ComfyUI 的結果圖（output，或 PreviewImage 產生的 temp），不開放 input
+    const viewType = type === undefined ? 'output' : String(type);
+    if (viewType !== 'output' && viewType !== 'temp') {
+      return res.status(400).send('Only output or temp media is allowed');
+    }
 
     try {
-      const comfyImgUrl = `${COMFYUI_URL}/view?filename=${encodeURIComponent(String(filename))}&subfolder=${encodeURIComponent(String(subfolder || ''))}&type=${encodeURIComponent(String(type || 'output'))}`;
+      const comfyImgUrl = `${COMFYUI_URL}/view?filename=${encodeURIComponent(String(filename))}&subfolder=${encodeURIComponent(String(subfolder || ''))}&type=${viewType}`;
       const imgRes = await fetch(comfyImgUrl);
 
       if (!imgRes.ok) return res.status(404).send('Media not found in ComfyUI');
@@ -811,6 +744,15 @@ async function startServer() {
       let finalWorkflowId = parsed.workflowId;
       if (finalWorkflowId !== 'chat_only' && !WORKFLOW_PARAM_MAPS[finalWorkflowId]) {
         finalWorkflowId = uploadedImage ? 'image_edit' : 'flux_t2i';
+      }
+
+      // 派工 LLM 只負責判斷工作流；英文提示詞改用忠實翻譯，避免小模型改寫或編造內容
+      if (finalWorkflowId !== 'chat_only' && userPrompt && containsCjk(userPrompt)) {
+        const translated = await translatePrompt(translator, userPrompt, { portrait: false });
+        if (translated.translated) {
+          parsed.prompt = translated.text;
+          console.log(`[Translate] ${translated.provider} → ${translated.text}`);
+        }
       }
 
       const sizeParsed = parseDimensions(userPrompt || '');
@@ -871,6 +813,10 @@ async function startServer() {
       console.log(`[Dispatch] 開始調度工作流: ${resolvedWorkflowId}`);
       console.log(`[Dispatch] 提詞內容: "${userPrompt}"`);
 
+      // FLUX 對中文理解差：含中文時先翻成英文
+      const englishPrompt = await toEnglishPrompt(String(userPrompt || ''));
+      const negativePrompt = await toEnglishPrompt(String(params?.negativePrompt || ''));
+
       let imageFilename = params?.inputImage || params?.uploadedImage;
       if (imageFilename && typeof imageFilename === 'string') {
         const savedName = `input_${Date.now()}.png`;
@@ -903,10 +849,10 @@ async function startServer() {
                 replacements[nodeId][paramKey] = seed;
                 break;
               case 'prompt':
-                replacements[nodeId][paramKey] = userPrompt || '';
+                replacements[nodeId][paramKey] = englishPrompt || '';
                 break;
               case 'negativePrompt':
-                replacements[nodeId][paramKey] = params?.negativePrompt || '';
+                replacements[nodeId][paramKey] = negativePrompt;
                 break;
               case 'width':
                 replacements[nodeId][paramKey] = width;
@@ -943,6 +889,7 @@ async function startServer() {
         progress: result.success ? 100 : 0,
         outputType: result.outputType,
         outputUrl: result.outputUrl,
+        translatedPrompt: englishPrompt !== userPrompt ? englishPrompt : undefined,
         avatarResponse: {
           text: result.success ? '已經為您調度 ComfyUI 成功完成創作！' : '生成失敗，請檢查 ComfyUI 控制台',
         },
@@ -1085,13 +1032,18 @@ async function startServer() {
 
   app.use('/comfyui_output', express.static(COMFYUI_OUTPUT_DIR));
 
-  const server = app.listen(PORT, '0.0.0.0', () => {
+  const server = app.listen(PORT, HOST, () => {
+    const shownHost = HOST.includes(':') ? `[${HOST}]` : HOST;
     console.log(`=================================================`);
-    console.log(`🚀 Image Generation MCP Server (SSE + WebUI) 已啟動！`);
-    console.log(`• Web 前端網址: http://127.0.0.1:${PORT}`);
-    console.log(`• MCP SSE 端點: http://127.0.0.1:${PORT}/sse`);
+    console.log(`🚀 Image Generation MCP Server (Streamable HTTP + SSE + WebUI) 已啟動！`);
+    console.log(`• Web 前端網址: http://${shownHost}:${PORT}`);
+    console.log(`• MCP 端點: http://${shownHost}:${PORT}/mcp（舊版 SSE: /sse）`);
+    console.log(`• MCP 驗證: ${MCP_AUTH_TOKEN ? '已啟用 Bearer Token' : '未啟用（僅限本機）'}`);
+    console.log(`• Web UI 外部存取: ${WEBUI_PASSWORD ? '需輸入 WEBUI_PASSWORD' : '關閉（僅限本機）'}`);
     console.log(`=================================================`);
   });
+  // 生圖最長可達 PORTRAIT_TIMEOUT_SECONDS，避免 Node 預設 5 分鐘請求逾時中斷 MCP 呼叫
+  server.requestTimeout = (positiveIntEnv('PORTRAIT_TIMEOUT_SECONDS', 600) + 120) * 1000;
 
   process.on('SIGINT', () => {
     server.close(() => {
@@ -1101,4 +1053,7 @@ async function startServer() {
   });
 }
 
-startServer().catch(console.error);
+startServer().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

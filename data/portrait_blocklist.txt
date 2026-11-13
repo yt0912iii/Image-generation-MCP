@@ -1,0 +1,66 @@
+# 頭像生成專用禁止詞（補足 Sensitive-lexicon 未涵蓋的血腥、暴力、裸露描述）
+# 一行一詞，# 開頭為註解。繁簡皆可，比對前會轉成簡體。
+# 英文詞以單字邊界比對（gore 不會擋到 gorgeous）。
+
+# 血腥與暴力
+血腥
+血淋淋
+鮮血四濺
+流血
+斷頭
+斷肢
+肢解
+碎屍
+屍體
+屍塊
+內臟
+開膛
+砍頭
+斬首
+虐殺
+殺人
+屠殺
+自殺
+自殘
+割腕
+上吊
+槍殺
+爆頭
+酷刑
+虐待
+
+# 裸露與性
+裸體
+全裸
+半裸
+裸露
+露點
+三點全露
+性感內衣
+情趣內衣
+色情
+成人內容
+
+# English
+gore
+gory
+bloody
+blood splatter
+decapitated
+decapitation
+dismembered
+corpse
+dead body
+mutilated
+torture
+suicide
+self-harm
+nude
+nudity
+naked
+topless
+nsfw
+porn
+pornographic
+hentai
+explicit
